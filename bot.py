@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 
 intents = discord.Intents.default()
 intents.members = True
+intents.message_content = True
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -91,6 +92,63 @@ async def on_member_join(member: discord.Member):
             try:
                 await member.kick(reason="Anti-raid: cuenta nueva durante raid detectado")
             except discord.Forbidden:
+                pass
+
+
+# ── Anti-Spam (mensajes repetidos) ──────────────────────────
+SPAM_UMBRAL = 3          # cantidad de mensajes iguales seguidos para considerarlo spam
+SPAM_VENTANA = 5         # segundos en los que se cuentan esos mensajes
+TIMEOUT_SPAM_MIN = 5     # minutos de aislamiento tras detectar spam
+
+historial_mensajes = defaultdict(list)  # (guild_id, user_id) -> [(contenido, datetime, message), ...]
+
+
+@client.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+
+    clave = (message.guild.id, message.author.id)
+    ahora = datetime.utcnow()
+    contenido = message.content.strip().lower()
+
+    if not contenido:
+        return
+
+    historial_mensajes[clave].append((contenido, ahora, message))
+    historial_mensajes[clave] = [
+        (c, ts, m) for (c, ts, m) in historial_mensajes[clave]
+        if (ahora - ts).total_seconds() <= SPAM_VENTANA
+    ]
+
+    iguales = [m for (c, ts, m) in historial_mensajes[clave] if c == contenido]
+
+    if len(iguales) >= SPAM_UMBRAL:
+        for m in iguales:
+            try:
+                await m.delete()
+            except (discord.NotFound, discord.Forbidden):
+                pass
+
+        historial_mensajes[clave] = []
+
+        try:
+            aviso = await message.channel.send(
+                f"🚫 {message.author.mention} fue detectado enviando spam y sus mensajes fueron eliminados."
+            )
+        except discord.Forbidden:
+            aviso = None
+
+        try:
+            await message.author.timeout(timedelta(minutes=TIMEOUT_SPAM_MIN), reason="Anti-spam: mensajes repetidos")
+        except (discord.Forbidden, AttributeError):
+            pass
+
+        if aviso:
+            await asyncio.sleep(6)
+            try:
+                await aviso.delete()
+            except (discord.NotFound, discord.Forbidden):
                 pass
 
 
