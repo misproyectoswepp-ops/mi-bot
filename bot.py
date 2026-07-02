@@ -152,6 +152,129 @@ async def on_message(message: discord.Message):
                 pass
 
 
+# ── Anti-Nuke (detecta acciones destructivas / comandos dañinos) ──
+antinuke_config = {}                     # guild_id -> {"activo", "umbral", "ventana", "canal_alertas"}
+antinuke_acciones = defaultdict(list)    # (guild_id, user_id) -> [datetime, ...]
+
+
+async def _registrar_accion_peligrosa(guild: discord.Guild, accion_tipo: str, executor: discord.abc.User):
+    if executor is None or executor.bot or executor.id == guild.owner_id:
+        return
+
+    gid = guild.id
+    cfg = antinuke_config.get(gid)
+    if not cfg or not cfg.get("activo"):
+        return
+
+    ahora = datetime.utcnow()
+    clave = (gid, executor.id)
+    antinuke_acciones[clave].append(ahora)
+    antinuke_acciones[clave] = [
+        ts for ts in antinuke_acciones[clave] if (ahora - ts).total_seconds() <= cfg["ventana"]
+    ]
+
+    if len(antinuke_acciones[clave]) < cfg["umbral"]:
+        return
+
+    miembro = guild.get_member(executor.id)
+    canal_alertas = client.get_channel(cfg.get("canal_alertas"))
+
+    if miembro:
+        try:
+            await miembro.edit(roles=[], reason="Anti-nuke: múltiples acciones destructivas detectadas")
+        except discord.Forbidden:
+            pass
+        try:
+            await miembro.kick(reason="Anti-nuke: múltiples acciones destructivas detectadas")
+        except discord.Forbidden:
+            pass
+
+    if canal_alertas:
+        embed = discord.Embed(
+            title="🚨 Anti-Nuke: Usuario Neutralizado",
+            description=f"**{executor}** realizó **{len(antinuke_acciones[clave])}** acciones destructivas "
+                        f"(última: `{accion_tipo}`) en los últimos {cfg['ventana']} segundos.",
+            color=discord.Color.dark_red()
+        )
+        embed.add_field(name="Acción tomada", value="Se le quitaron todos los roles y fue expulsado del servidor.", inline=False)
+        await canal_alertas.send(embed=embed)
+
+    antinuke_acciones[clave] = []
+
+
+@client.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
+        await _registrar_accion_peligrosa(channel.guild, "eliminar canal", entry.user)
+        break
+
+
+@client.event
+async def on_guild_role_delete(role: discord.Role):
+    async for entry in role.guild.audit_logs(limit=1, action=discord.AuditLogAction.role_delete):
+        await _registrar_accion_peligrosa(role.guild, "eliminar rol", entry.user)
+        break
+
+
+@client.event
+async def on_member_ban(guild: discord.Guild, user: discord.abc.User):
+    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
+        await _registrar_accion_peligrosa(guild, "banear miembro", entry.user)
+        break
+
+
+@client.event
+async def on_webhooks_update(channel: discord.abc.GuildChannel):
+    async for entry in channel.guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_create):
+        await _registrar_accion_peligrosa(channel.guild, "crear webhook", entry.user)
+        break
+
+
+@client.event
+async def on_member_remove(member: discord.Member):
+    await asyncio.sleep(1)  # dar tiempo a que Discord registre el audit log
+    async for entry in member.guild.audit_logs(limit=3, action=discord.AuditLogAction.kick):
+        if entry.target and entry.target.id == member.id:
+            segundos = (datetime.utcnow() - entry.created_at.replace(tzinfo=None)).total_seconds()
+            if segundos < 5:
+                await _registrar_accion_peligrosa(member.guild, "expulsar miembro", entry.user)
+            break
+
+
+@tree.command(name="antinuke", description="Activa o desactiva la protección anti-nuke (acciones destructivas)")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(
+    activar="True para activar, False para desactivar",
+    umbral="Cantidad de acciones destructivas para neutralizar al usuario (por defecto 3)",
+    ventana="Ventana de tiempo en segundos para contar esas acciones (por defecto 15)",
+    canal_alertas="Canal donde enviar las alertas (por defecto, el canal actual)"
+)
+async def antinuke(
+    interaction: discord.Interaction,
+    activar: bool,
+    umbral: int = 3,
+    ventana: int = 15,
+    canal_alertas: discord.TextChannel = None
+):
+    gid = interaction.guild.id
+    if activar:
+        antinuke_config[gid] = {
+            "activo": True,
+            "umbral": umbral,
+            "ventana": ventana,
+            "canal_alertas": (canal_alertas or interaction.channel).id
+        }
+        await interaction.response.send_message(
+            f"🚨 Anti-nuke activado. Umbral: **{umbral}** acciones destructivas en **{ventana}** segundos. "
+            f"Alertas en {(canal_alertas or interaction.channel).mention}",
+            ephemeral=True
+        )
+    else:
+        if gid in antinuke_config:
+            antinuke_config[gid]["activo"] = False
+        await interaction.response.send_message("❌ Anti-nuke desactivado.", ephemeral=True)
+
+
 # ── Comandos ─────────────────────────────────────────────────
 @tree.command(name="antiraid", description="Activa o desactiva la protección anti-raid")
 @app_commands.checks.has_permissions(administrator=True)
